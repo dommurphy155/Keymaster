@@ -24,6 +24,11 @@ StartLimitBurst=3
 TimeoutStopSec=30
 KillSignal=SIGTERM
 
+# File descriptor and process limits
+LimitNOFILE=65535
+LimitNPROC=4096
+TasksMax=infinity
+
 # Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
