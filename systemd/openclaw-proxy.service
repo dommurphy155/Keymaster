@@ -1,0 +1,35 @@
+[Unit]
+Description=OpenClaw Keymaster Proxy
+Documentation=https://github.com/dommurphy155/Keymaster
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%USER%
+WorkingDirectory=%HOME%/.openclaw/skills/keymaster
+Environment=PYTHONPATH=%HOME%/.openclaw/skills/keymaster
+Environment=HOME=%HOME%
+
+# Start the proxy
+ExecStart=%PYTHON% -m uvicorn proxy.server:app --host 127.0.0.1 --port 8787 --loop uvloop --log-level info
+
+# Restart on failure
+Restart=always
+RestartSec=5
+StartLimitInterval=60s
+StartLimitBurst=3
+
+# Graceful shutdown
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=%HOME%/.openclaw
+
+[Install]
+WantedBy=multi-user.target
