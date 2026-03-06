@@ -13,6 +13,7 @@ import asyncio
 import json
 import random
 import time
+from datetime import datetime
 from typing import AsyncGenerator, Optional, Dict
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +25,30 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .key_manager import KeyManager, KeyState
+
+# Logging helper with timestamps
+def log_msg(level: str, msg: str):
+    """Log message with timestamp."""
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{ts}] [{level}] {msg}")
+
+def log_proxy(msg: str):
+    log_msg("PROXY", msg)
+
+def log_key(msg: str):
+    log_msg("KEY", msg)
+
+def log_req(msg: str):
+    log_msg("REQ", msg)
+
+def log_res(msg: str):
+    log_msg("RES", msg)
+
+def log_err(msg: str):
+    log_msg("ERR", msg)
+
+def log_stream(msg: str):
+    log_msg("STREAM", msg)
 
 # Thread pool for running sync requests library
 thread_pool = ThreadPoolExecutor(max_workers=20)
@@ -63,7 +88,7 @@ async def lifespan(app: FastAPI):
     """Initialize and cleanup resources."""
     global key_manager, http_client
 
-    print("[Proxy] Starting up...")
+    log_proxy("Starting up...")
     key_manager = KeyManager()
     # Use a more robust timeout configuration
     timeout = httpx.Timeout(120.0, connect=30.0, read=120.0, write=30.0)
@@ -74,11 +99,11 @@ async def lifespan(app: FastAPI):
         follow_redirects=True,
         http2=False  # Disable HTTP/2 to avoid content-length issues
     )
-    print(f"[Proxy] Ready with {len(key_manager.keys)} keys")
+    log_proxy(f"Ready with {len(key_manager.keys)} keys")
 
     yield
 
-    print("[Proxy] Shutting down...")
+    log_proxy("Shutting down...")
     if http_client:
         await http_client.aclose()
 
@@ -106,7 +131,8 @@ async def stream_response(
     url: str,
     headers: dict,
     body: dict,
-    key: KeyState
+    key: KeyState,
+    req_start_time: float
 ) -> AsyncGenerator[bytes, None]:
     """
     Stream response from NVIDIA API.
@@ -116,6 +142,11 @@ async def stream_response(
     # Increment streaming request counter
     await metrics.inc("total_streaming_requests")
 
+    # Extract request info for logging
+    model = body.get("model", "unknown") if body else "unknown"
+    msg_count = len(body.get("messages", [])) if body else 0
+    max_tokens = body.get("max_tokens", "default") if body else "default"
+
     # Replace auth header with the selected key (remove any existing auth first)
     headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
     headers["Authorization"] = f"Bearer {key.key}"
@@ -124,16 +155,17 @@ async def stream_response(
     headers.pop("host", None)
 
     # Remove content-length and transfer-encoding for streaming
-    # These cause "Too much data for declared Content-Length" errors
     headers.pop("content-length", None)
     headers.pop("transfer-encoding", None)
     headers.pop("Content-Length", None)
     headers.pop("Transfer-Encoding", None)
 
+    log_stream(f"→ {key.name}/{model} ({msg_count} msgs, max_tokens={max_tokens})")
+
     chunks_sent = 0
+    last_log_time = time.time()
     try:
         # Use unlimited read timeout for streaming - LLM can take very long between chunks
-        # Only apply timeout to connection establishment, not to waiting for chunks
         stream_timeout = httpx.Timeout(None, connect=60.0, read=None, write=30.0)
         async with client.stream(
             "POST",
@@ -142,7 +174,7 @@ async def stream_response(
             json=body,
             timeout=stream_timeout
         ) as response:
-            # Check for rate limit (before streaming starts - can still retry)
+            # Check for retryable errors before streaming starts
             if response.status_code == 429:
                 cooldown = 60
                 retry_after = response.headers.get("retry-after")
@@ -159,29 +191,59 @@ async def stream_response(
                         pass
 
                 key_manager.mark_cooldown(key.name, cooldown)
+                log_key(f"{key.name} → cooling {cooldown}s (429)")
                 raise RateLimitError(f"Rate limited on {key.name}")
 
-            # Forward status and headers (except auth-related)
+            # Check for gateway errors
+            if response.status_code in [502, 503, 504]:
+                log_err(f"Gateway {response.status_code} on {key.name}, will retry")
+                raise RateLimitError(f"Gateway error {response.status_code} on {key.name}")
+
+            # Forward status and headers
             response.raise_for_status()
+
+            # Log connection established
+            elapsed = time.time() - req_start_time
+            log_stream(f"← Connected in {elapsed:.2f}s, streaming...")
 
             # Stream chunks directly without modification
             async for chunk in response.aiter_raw():
                 yield chunk
                 chunks_sent += 1
 
+                # Log progress every 5 seconds
+                now = time.time()
+                if now - last_log_time > 5:
+                    stream_elapsed = now - req_start_time
+                    log_stream(f"↻ {chunks_sent} chunks, {stream_elapsed:.1f}s elapsed")
+                    last_log_time = now
+
+            # Log completion
+            total_elapsed = time.time() - req_start_time
+            log_stream(f"✓ Complete: {chunks_sent} chunks, {total_elapsed:.2f}s total")
+
     except RateLimitError:
         raise  # Let caller retry with new key
     except httpx.ReadTimeout as e:
-        # Read timeout during streaming - treat like a rate limit and retry
         await metrics.inc("total_streaming_errors")
-        print(f"[Proxy] Read timeout after {chunks_sent} chunks on {key.name}: {e}")
-        # Mark key as cooling briefly (30s) - might be temporary network issue
+        elapsed = time.time() - req_start_time
+        log_err(f"Read timeout after {chunks_sent} chunks, {elapsed:.1f}s on {key.name}")
         key_manager.mark_cooldown(key.name, 30)
         raise RateLimitError(f"Read timeout on {key.name}")
-    except Exception as e:
-        # Log streaming error but cannot recover
+    except httpx.HTTPStatusError as e:
         await metrics.inc("total_streaming_errors")
-        print(f"[Proxy] Stream error after {chunks_sent} chunks: {e}")
+        status = e.response.status_code
+        elapsed = time.time() - req_start_time
+        if status in [502, 503, 504]:
+            log_err(f"Server error {status} after {chunks_sent} chunks, {elapsed:.1f}s on {key.name}")
+            raise RateLimitError(f"Server error {status} on {key.name}")
+        else:
+            log_err(f"HTTP {status} after {chunks_sent} chunks: {e}")
+            raise
+    except Exception as e:
+        await metrics.inc("total_streaming_errors")
+        elapsed = time.time() - req_start_time
+        log_err(f"Stream error after {chunks_sent} chunks, {elapsed:.1f}s: {e}")
         raise  # Re-raise to terminate stream
 
 
@@ -263,14 +325,29 @@ async def proxy_request(request: Request, path: str):
         except:
             body = await request.body()
 
+    # Log request details
+    model = body.get("model", "unknown") if body else "unknown"
+    msg_count = len(body.get("messages", [])) if body else 0
+    is_streaming = body.get("stream", False) if body else False
+    first_msg = ""
+    if body and msg_count > 0:
+        first_content = body["messages"][0].get("content", "")
+        first_msg = first_content[:50] + "..." if len(first_content) > 50 else first_content
+
+    log_req(f"→ {model} ({msg_count} msgs, stream={is_streaming})")
+    if first_msg:
+        log_req(f"  first: {first_msg}")
+
+    # Track request start time
+    req_start_time = time.time()
+
     # Get all available keys (not on cooldown)
     available_keys = key_manager.get_all_available_keys()
 
     # If all keys cooling, return 503 immediately
-    # OpenClaw will retry with backoff - better than timing out
     if not available_keys:
         earliest = key_manager.get_earliest_cooldown()
-        print(f"[Proxy] All keys cooling, earliest available in {earliest:.1f}s")
+        log_key(f"All cooling, earliest in {earliest:.1f}s")
         raise HTTPException(
             status_code=503,
             detail=f"All API keys cooling. Retry in {int(earliest)}s."
@@ -301,16 +378,16 @@ async def proxy_request(request: Request, path: str):
 
         if not acquired:
             # Key is busy with 5 concurrent requests, try next key
-            print(f"[Proxy] Key {key_name} busy, trying next...")
+            log_key(f"{key_name} busy (5 concurrent), skip")
             continue
 
         # Got the key, mark as attempted
         keys_attempted.add(key_name)
-        print(f"[Proxy] Using {key_name} (attempt {len(keys_attempted)}/{MAX_RETRIES})")
+        log_key(f"Using {key_name} (attempt {len(keys_attempted)}/{MAX_RETRIES})")
 
         try:
             result = await _make_request_with_key(
-                http_client, request, target_url, headers, body, key
+                http_client, request, target_url, headers, body, key, req_start_time
             )
 
             if result is not None:
@@ -339,7 +416,7 @@ async def proxy_request(request: Request, path: str):
 
         except Exception as e:
             error_msg = str(e)
-            print(f"[Proxy] Error with {key_name}: {error_msg}")
+            log_err(f"{key_name}: {error_msg}")
             last_error = error_msg
             continue
 
@@ -348,6 +425,8 @@ async def proxy_request(request: Request, path: str):
                 key.semaphore.release()
 
     # All retries exhausted
+    elapsed = time.time() - req_start_time
+    log_err(f"All {len(keys_attempted)} keys exhausted after {elapsed:.1f}s. Last: {last_error}")
     raise HTTPException(
         status_code=503,
         detail=f"All keys busy or cooling. Last error: {last_error}"
@@ -360,7 +439,8 @@ async def _make_request_with_key(
     target_url: str,
     headers: dict,
     body: any,
-    key: KeyState
+    key: KeyState,
+    req_start_time: float
 ) -> Optional[Response]:
     """
     Make request with a specific key.
@@ -374,7 +454,7 @@ async def _make_request_with_key(
     if is_streaming and request.method == "POST":
         # Streaming response - use generator
         return StreamingResponse(
-            stream_response(http_client, target_url, headers, body, key),
+            stream_response(http_client, target_url, headers, body, key, req_start_time),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -388,9 +468,9 @@ async def _make_request_with_key(
         request_headers.pop("host", None)
         request_headers["accept-encoding"] = "identity"
 
+        log_stream(f"→ {key.name} (non-streaming)")
+
         # Use requests library instead of httpx for non-streaming requests
-        # requests is more lenient with content-length mismatches (NVIDIA bug)
-        # Run in thread pool to keep it async
         def make_sync_request():
             resp = requests.request(
                 request.method,
@@ -405,7 +485,11 @@ async def _make_request_with_key(
             status_code, resp_headers, content_bytes = await asyncio.get_event_loop().run_in_executor(
                 thread_pool, make_sync_request
             )
+            elapsed = time.time() - req_start_time
+            log_stream(f"✓ {key.name} completed in {elapsed:.2f}s")
         except Exception as e:
+            elapsed = time.time() - req_start_time
+            log_err(f"{key.name} failed after {elapsed:.1f}s: {e}")
             raise HTTPException(status_code=502, detail=f"Request failed: {str(e)}")
 
         # Reconstruct a fake response object for the code below
@@ -430,13 +514,20 @@ async def _make_request_with_key(
                     pass
             key_manager.mark_cooldown(key.name, cooldown)
             await metrics.inc("total_rate_limits")
+            log_key(f"{key.name} → cooling {cooldown}s (429)")
             return None  # Signal to retry with different key
 
         # Handle server errors
         if response.status_code in [500, 502, 503, 504]:
+            log_err(f"Server error {response.status_code} on {key.name}")
             response.raise_for_status()  # Will trigger retry via exception
 
         response.raise_for_status()
+
+        # Log success
+        elapsed = time.time() - req_start_time
+        content_len = len(response._content)
+        log_res(f"← {key.name}: {content_len} bytes in {elapsed:.2f}s")
 
         # Success - return response
         content = response._content

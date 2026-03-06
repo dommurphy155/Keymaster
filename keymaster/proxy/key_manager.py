@@ -15,6 +15,13 @@ import asyncio
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
+from datetime import datetime
+
+
+def log_key(msg: str):
+    """Log with timestamp."""
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{ts}] [KEY] {msg}")
 
 
 @dataclass
@@ -71,7 +78,7 @@ class KeyManager:
         if not self.keys:
             raise ValueError("No NVIDIA keys found in auth-profiles.json")
 
-        print(f"[KeyManager] Loaded {len(self.keys)} keys")
+        log_key(f"Loaded {len(self.keys)} keys")
 
     def get_key_for_request(self) -> Optional[KeyState]:
         """
@@ -97,7 +104,7 @@ class KeyManager:
         if key_name in self.keys:
             cooldown = cooldown_seconds or self.DEFAULT_COOLDOWN
             self.keys[key_name].cooldown_until = time.time() + cooldown
-            print(f"[KeyManager] Key {key_name} on cooldown for {cooldown}s")
+            log_key(f"{key_name} → cooling {cooldown}s")
 
     def get_cooldown_remaining(self, key_name: str) -> float:
         """Get seconds remaining for key cooldown."""
@@ -126,7 +133,7 @@ class KeyManager:
         """Reset all cooldowns (emergency use)."""
         for key in self.keys.values():
             key.cooldown_until = 0
-        print("[KeyManager] All keys reset")
+        log_key("All keys reset")
 
     def get_status(self) -> Dict:
         """Get current status of all keys."""
