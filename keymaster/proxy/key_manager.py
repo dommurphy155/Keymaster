@@ -25,6 +25,13 @@ class KeyState:
     role: str
     cooldown_until: float = 0
     priority: int = 99
+    semaphore: asyncio.Semaphore = None  # Concurrency limit per key
+
+    def __post_init__(self):
+        if self.semaphore is None:
+            # Allow 5 concurrent requests per key
+            # NVIDIA actually supports decent parallelism, this prevents bottlenecks
+            self.semaphore = asyncio.Semaphore(5)
 
 
 class KeyManager:
@@ -105,6 +112,15 @@ class KeyManager:
             name for name, key in self.keys.items()
             if now >= key.cooldown_until
         ]
+
+    def get_earliest_cooldown(self) -> float:
+        """Get seconds until the earliest key is available."""
+        now = time.time()
+        earliest = float('inf')
+        for key in self.keys.values():
+            if key.cooldown_until > now:
+                earliest = min(earliest, key.cooldown_until - now)
+        return earliest if earliest != float('inf') else 0
 
     def reset_all_keys(self):
         """Reset all cooldowns (emergency use)."""
