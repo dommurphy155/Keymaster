@@ -127,32 +127,20 @@ async def stream_response(
     # These cause "Too much data for declared Content-Length" errors
     headers.pop("content-length", None)
     headers.pop("transfer-encoding", None)
-
-    # Remove content-length and transfer-encoding for streaming
-    # These cause "Too much data for declared Content-Length" errors
-    headers.pop("content-length", None)
-    headers.pop("transfer-encoding", None)
-
-    # Remove content-length and transfer-encoding for streaming
-    # These cause "Too much data for declared Content-Length" errors
-    headers.pop("content-length", None)
-    headers.pop("transfer-encoding", None)
-
-    # Remove content-length and transfer-encoding for streaming
-    # (httpx will set these correctly based on the actual response)
-    headers.pop("content-length", None)
-    headers.pop("transfer-encoding", None)
     headers.pop("Content-Length", None)
     headers.pop("Transfer-Encoding", None)
 
     chunks_sent = 0
     try:
+        # Use unlimited read timeout for streaming - LLM can take very long between chunks
+        # Only apply timeout to connection establishment, not to waiting for chunks
+        stream_timeout = httpx.Timeout(None, connect=60.0, read=None, write=30.0)
         async with client.stream(
             "POST",
             url,
             headers=headers,
             json=body,
-            timeout=120.0
+            timeout=stream_timeout
         ) as response:
             # Check for rate limit (before streaming starts - can still retry)
             if response.status_code == 429:
@@ -183,6 +171,13 @@ async def stream_response(
 
     except RateLimitError:
         raise  # Let caller retry with new key
+    except httpx.ReadTimeout as e:
+        # Read timeout during streaming - treat like a rate limit and retry
+        await metrics.inc("total_streaming_errors")
+        print(f"[Proxy] Read timeout after {chunks_sent} chunks on {key.name}: {e}")
+        # Mark key as cooling briefly (30s) - might be temporary network issue
+        key_manager.mark_cooldown(key.name, 30)
+        raise RateLimitError(f"Read timeout on {key.name}")
     except Exception as e:
         # Log streaming error but cannot recover
         await metrics.inc("total_streaming_errors")
