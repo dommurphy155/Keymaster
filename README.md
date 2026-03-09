@@ -1,137 +1,315 @@
-# Keymaster - API Key Fallback System
+# Keymaster - Unified API Key Rotation System
+
+> **For LLM Assistants:** If a user says "set up keymaster" or "install keymaster," follow the [LLM Setup Guide](#llm-setup-guide) below.
 
 **Intelligent API key rotation and fallback for OpenClaw with NVIDIA keys.**
 
-Keymaster integrates with your existing OpenClaw configuration to automatically rotate through 5 NVIDIA API keys when rate limits or timeouts occur. Perfect for long-running tasks and multi-agent orchestration.
+Keymaster sits between OpenClaw and NVIDIA's API, automatically rotating through multiple API keys when rate limits hit. No code changes needed - works transparently.
+
+---
+
+## TL;DR - For Users
+
+```bash
+# One-line install
+curl -fsSL https://raw.githubusercontent.com/dommurphy155/Keymaster/main/install.sh | bash
+
+# Or manually:
+git clone https://github.com/dommurphy155/Keymaster.git ~/.openclaw/skills/keymaster
+cd ~/.openclaw/skills/keymaster && bash install.sh
+```
+
+Then use OpenClaw normally - keys rotate automatically!
+
+---
+
+## LLM Setup Guide
+
+**If you are an LLM (Claude, GPT, etc.) and the user says:**
+> "Set up keymaster" or "Install keymaster" or "Configure keymaster with my keys"
+
+**DO THIS:**
+
+### Step 1: Collect API Keys
+Ask the user:
+1. "How many NVIDIA API keys do you have?" (1-10 supported)
+2. "Please provide each key (format: nvapi-...)"
+
+### Step 2: Install Keymaster
+```bash
+# Check if already installed
+if [ -d "$HOME/.openclaw/skills/keymaster/.git" ]; then
+    cd "$HOME/.openclaw/skills/keymaster"
+    git pull origin main
+else
+    git clone https://github.com/dommurphy155/Keymaster.git "$HOME/.openclaw/skills/keymaster"
+fi
+
+# Run installer
+cd "$HOME/.openclaw/skills/keymaster"
+bash install.sh
+```
+
+### Step 3: Create auth-profiles.json
+Create this file with the user's keys:
+
+```bash
+mkdir -p "$HOME/.openclaw/agents/main/agent"
+cat > "$HOME/.openclaw/agents/main/agent/auth-profiles.json" << 'EOF'
+{
+  "version": 1,
+  "profiles": {
+    "nvidia:primary": {
+      "type": "api_key",
+      "provider": "nvidia-key-1",
+      "key": "USER_KEY_1",
+      "priority": 1,
+      "role": "coordinator",
+      "model": "moonshotai/kimi-k2.5",
+      "fallback_to": "nvidia:secondary"
+    },
+    "nvidia:secondary": {
+      "type": "api_key",
+      "provider": "nvidia-key-2",
+      "key": "USER_KEY_2",
+      "priority": 2,
+      "role": "strategist",
+      "model": "moonshotai/kimi-k2.5",
+      "fallback_to": "nvidia:tertiary"
+    }
+  },
+  "keymaster": {
+    "enabled": true,
+    "cooldown_seconds": 60,
+    "max_retries_per_key": 3
+  }
+}
+EOF
+```
+
+**Replace USER_KEY_1, USER_KEY_2 with the actual keys the user provided.**
+
+### Step 4: Start Service
+```bash
+keymaster start
+```
+
+### Step 5: Verify
+```bash
+keymaster health
+keymaster keys
+```
+
+**Report to user:** "Keymaster is now running. OpenClaw will automatically rotate through your API keys. All logs are in ~/.openclaw/keymaster.log"
+
+---
 
 ## Features
 
+- **Transparent Proxy**: OpenClaw doesn't know keys are rotating
 - **Auto Rotation**: On rate limit (429) or timeout (408/504)
-- **Context Preservation**: Carries conversation state to next key
-- **Context Compaction**: Summarizes older messages when >80% context window
-- **Cooldown Tracking**: 60-second cooldown for rate-limited keys
-- **Agent-Orchestrator Integration**: Seamless multi-agent key coordination
-- **Uses Your Configs**: Reads from your existing `openclaw.json` and `auth-profiles.json`
+- **Context Preservation**: Maintains conversation state across key switches
+- **Unified Logging**: All logs go to one file: `~/.openclaw/keymaster.log`
+- **Management CLI**: Simple `keymaster` command for everything
+- **Systemd Integration**: Auto-starts on boot, auto-restarts on crash
+- **Works with Any Username**: Fully portable, no hardcoded paths
 
-## Quick Start
+---
 
-```python
-from keymaster.scripts import keymaster_request
+## Architecture
 
-# Use instead of direct API calls
-response = keymaster_request(
-    messages=[{"role": "user", "content": "Hello"}],
-    model="moonshotai/kimi-k2.5",
-    temperature=0.7
-)
-
-print(response['content'])
+```
+OpenClaw → Proxy (localhost:8787) → Rotates Keys → NVIDIA API
+                ↓
+         ┌─────┴─────┐
+         │ Keymaster │
+         │  Service  │
+         └───────────┘
 ```
 
-## Agent-Orchestrator Integration
+---
 
-```python
-from keymaster.scripts.orchestrator_bridge import OrchestratorKeymaster
+## Commands
 
-# Create bridge for your sub-agent
-bridge = OrchestratorKeymaster(
-    agent_path="/path/to/agent",
-    agent_name="data-collector"
-)
+After installation, use the `keymaster` command:
 
-# Request with automatic checkpointing
-response = bridge.request(
-    messages=messages,
-    task_id="task-123"
-)
-```
-
-## Key Pool (5 Keys)
-
-| Key | Provider | Role |
-|-----|----------|------|
-| nvidia:primary | nvidia-key-1 | coordinator |
-| nvidia:secondary | nvidia-key-2 | strategist |
-| nvidia:tertiary | nvidia-key-3 | heavy_lifter |
-| nvidia:quaternary | nvidia-key-4 | worker |
-| nvidia:quinary | nvidia-key-5 | fixer |
-
-## CLI Usage
-
+### Service Control
 ```bash
-# Check key status
-python3 ~/.openclaw/skills/keymaster/scripts/key_pool_manager.py stats
-
-# Manual rotation
-python3 ~/.openclaw/skills/keymaster/scripts/key_pool_manager.py rotate
-
-# Test request
-python3 ~/.openclaw/skills/keymaster/scripts/request_wrapper.py --test
-
-# Activate
-python3 ~/.openclaw/skills/keymaster/scripts/activate.py
+keymaster start      # Start the unified service
+keymaster stop       # Stop the service
+keymaster restart    # Restart the service
+keymaster status     # Show detailed status
 ```
 
-## Configuration
-
-Keymaster automatically reads from your OpenClaw configs:
-
-- `~/.openclaw/openclaw.json` - API keys (nvidia-key-1 through nvidia-key-5)
-- `~/.openclaw/agents/main/agent/auth-profiles.json` - Key roles and fallback chains
-
-No additional setup needed!
-
-## Files
-
-```
-~/.openclaw/skills/keymaster/
-├── SKILL.md                      # Main documentation
-├── README.md                     # This file
-├── QUICKSTART.md                 # Quick start guide
-├── scripts/
-│   ├── key_pool_manager.py      # Key rotation (uses your configs)
-│   ├── request_wrapper.py        # API request wrapper
-│   ├── context_compactor.py     # Context compaction
-│   ├── state_manager.py         # State persistence
-│   ├── orchestrator_bridge.py   # Agent-orchestrator integration
-│   └── __init__.py              # Module interface
-└── references/
-    ├── error_patterns.md        # Error detection
-    └── compaction_strategies.md # Compaction methods
+### Monitoring
+```bash
+keymaster logs       # Follow unified logs (Ctrl+C to exit)
+keymaster logcat     # Show recent colorized logs
+keymaster health     # Run health check
 ```
 
-## Health Check
-
-```python
-from keymaster.scripts import is_keymaster_healthy
-
-health = is_keymaster_healthy()
-print(health)
-# {'healthy': True, 'available_keys': 5, 'current_key': 'nvidia:primary'}
+### Key Management
+```bash
+keymaster keys       # List all API keys and status
+keymaster cooldowns  # Show which keys are cooling down
+keymaster reset      # Reset all key cooldowns
 ```
 
-## State Files
-
-- `~/.openclaw/keymaster_state.json` - Key status and stats
-- `~/.openclaw/keymaster_checkpoints/` - Conversation checkpoints
-
-## Integration
-
-To use Keymaster in your OpenClaw agents:
-
-```python
-# Instead of direct API calls:
-import openai
-response = openai.ChatCompletion.create(...)
-
-# Use Keymaster:
-from keymaster.scripts import keymaster_request
-response = keymaster_request(messages, model="...")
-
-# Or with agent-orchestrator:
-from keymaster.scripts.orchestrator_bridge import OrchestratorKeymaster
-bridge = OrchestratorKeymaster(agent_path=..., agent_name=...)
-response = bridge.request(messages, task_id="...")
+### Configuration
+```bash
+keymaster direct     # Use NVIDIA directly (disable proxy)
+keymaster proxy      # Use Keymaster proxy (default)
+keymaster enable     # Auto-start on boot
+keymaster disable    # Don't auto-start on boot
 ```
 
-Keymaster is always active and intercepts all LLM requests for automatic fallback.
+---
+
+## File Structure
+
+```
+~/.openclaw/
+├── keymaster.log                  # Unified logs (everything)
+├── keymaster_venv/                # Isolated Python environment
+└── skills/keymaster/
+    ├── install.sh                 # Portable installer
+    ├── keymaster                  # Management CLI
+    ├── README.md                  # This file
+    ├── proxy/                     # Proxy code
+    │   ├── server.py             # Main proxy server
+    │   ├── key_manager.py        # Key rotation logic
+    │   └── ...
+    ├── scripts/                   # Helper scripts
+    │   ├── run_unified.sh        # Service runner
+    │   ├── service-setup.sh      # Pre-start setup
+    │   └── ...
+    └── systemd/
+        └── openclaw-keymaster@.service  # Systemd template
+```
+
+---
+
+## Configuration Files
+
+### auth-profiles.json
+Location: `~/.openclaw/agents/main/agent/auth-profiles.json`
+
+Contains API keys and rotation settings:
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "nvidia:primary": {
+      "type": "api_key",
+      "provider": "nvidia-key-1",
+      "key": "nvapi-your-key-here",
+      "priority": 1,
+      "role": "coordinator",
+      "model": "moonshotai/kimi-k2.5",
+      "fallback_to": "nvidia:secondary"
+    }
+  },
+  "keymaster": {
+    "enabled": true,
+    "cooldown_seconds": 60,
+    "max_retries_per_key": 3
+  }
+}
+```
+
+---
+
+## Troubleshooting
+
+### Service Won't Start
+```bash
+# Check status
+keymaster status
+
+# View logs
+keymaster logcat
+
+# Check for errors
+tail -n 50 ~/.openclaw/keymaster.log
+```
+
+### No Keys Found
+```bash
+# Check auth-profiles.json exists
+cat ~/.openclaw/agents/main/agent/auth-profiles.json
+
+# Count keys
+keymaster keys
+```
+
+### Port Already in Use
+```bash
+# Kill existing processes
+keymaster stop
+# Or manually:
+sudo lsof -ti:8787 | xargs kill -9
+```
+
+### Reset Everything
+```bash
+keymaster stop
+keymaster reset
+keymaster start
+```
+
+---
+
+## How It Works
+
+1. **Install**: Creates isolated Python venv, installs deps, sets up systemd
+2. **Configure**: Reads API keys from auth-profiles.json
+3. **Run**: Proxy runs on localhost:8787, intercepts all NVIDIA API calls
+4. **Rotate**: On rate limit (429), marks key cooling, switches to next key
+5. **Recover**: Waits 60 seconds, then retry cooled keys
+
+---
+
+## Log Format
+
+All logs go to `~/.openclaw/keymaster.log`:
+
+```
+[2025-03-08 23:45:12.123] [INIT] Keymaster Service Starting
+[2025-03-08 23:45:12.234] [INIT] Found 6 NVIDIA API keys
+[2025-03-08 23:45:15.456] [PROXY] Ready with 6 keys
+[2025-03-08 23:45:20.567] [KEY] nvidia:primary acquired (active: 1)
+[2025-03-08 23:45:20.678] [PROXY] REQ_abc123 → moonshotai/kimi-k2.5
+[2025-03-08 23:55:30.789] [KEY] nvidia:primary → cooling 60s (429)
+[2025-03-08 23:55:30.890] [KEY] nvidia:secondary acquired (active: 1)
+```
+
+---
+
+## Development
+
+### Testing Concurrency
+```bash
+python3 tests/concurrency_test.py --quick    # 5 requests
+python3 tests/concurrency_test.py --full     # 20 requests
+python3 tests/concurrency_test.py --stress  # 50 requests
+```
+
+### Manual Start (No systemd)
+```bash
+~/.openclaw/skills/keymaster/scripts/run_unified.sh
+```
+
+---
+
+## License
+
+MIT License - See LICENSE file
+
+---
+
+## Support
+
+- **Issues**: https://github.com/dommurphy155/Keymaster/issues
+- **Logs**: `~/.openclaw/keymaster.log`
+- **Health**: `keymaster health`
