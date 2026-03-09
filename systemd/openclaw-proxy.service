@@ -6,13 +6,22 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=%USER%
-WorkingDirectory=%HOME%/.openclaw/skills/keymaster
-Environment=PYTHONPATH=%HOME%/.openclaw/skills/keymaster
-Environment=HOME=%HOME%
+User=%I
+WorkingDirectory=/home/%I/.openclaw/skills/keymaster
+Environment=PYTHONPATH=/home/%I/.openclaw/skills/keymaster
+Environment=HOME=/home/%I
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/%I/.local/bin
 
-# Start the proxy
-ExecStart=%PYTHON% -m uvicorn proxy.server:app --host 127.0.0.1 --port 8787 --loop uvloop --log-level info
+# Pre-start: Configure OpenClaw to use proxy
+ExecStartPre=/bin/bash -c 'echo "[$(date)] Configuring OpenClaw to use proxy..." >> /home/%I/.openclaw/keymaster_proxy.log'
+ExecStartPre=/usr/bin/python3 /home/%I/.openclaw/skills/keymaster/scripts/configure_openclaw.py --enable
+
+# Start the proxy with unbuffered output for better logging
+ExecStart=/usr/bin/python3 -u -m uvicorn proxy.server:app --host 127.0.0.1 --port 8787 --loop uvloop --log-level info
+
+# Log output
+StandardOutput=append:/home/%I/.openclaw/keymaster_proxy.log
+StandardError=append:/home/%I/.openclaw/keymaster_proxy.log
 
 # Restart on failure
 Restart=always
@@ -34,7 +43,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=false
-ReadWritePaths=%HOME%/.openclaw
+ReadWritePaths=/home/%I/.openclaw
 
 [Install]
 WantedBy=multi-user.target

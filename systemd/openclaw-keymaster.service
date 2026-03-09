@@ -1,0 +1,68 @@
+[Unit]
+Description=OpenClaw Keymaster - Unified API Key Rotation Service
+Documentation=https://github.com/dommurphy155/Keymaster
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%I
+Group=%I
+WorkingDirectory=/home/%I/.openclaw/skills/keymaster
+
+# Create isolated venv and install deps on first start
+Environment="HOME=/home/%I"
+Environment="VIRTUAL_ENV=/home/%I/.openclaw/keymaster_venv"
+Environment="PATH=/home/%I/.openclaw/keymaster_venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=/home/%I/.openclaw/skills/keymaster"
+Environment="KEYMASTER_LOG=/home/%I/.openclaw/keymaster.log"
+
+# Pre-start: Ensure venv exists and has dependencies
+ExecStartPre=/bin/bash -c '\
+    if [ ! -d "$VIRTUAL_ENV" ]; then \
+        echo "[$(date +"%Y-%m-%d %H:%M:%S")] Creating virtual environment..." >> "$KEYMASTER_LOG"; \
+        python3 -m venv "$VIRTUAL_ENV"; \
+    fi'
+ExecStartPre=/bin/bash -c '\
+    if ! "$VIRTUAL_ENV/bin/python" -c "import fastapi, uvicorn, httpx, requests" 2>/dev/null; then \
+        echo "[$(date +"%Y-%m-%d %H:%M:%S")] Installing dependencies..." >> "$KEYMASTER_LOG"; \
+        "$VIRTUAL_ENV/bin/pip" install -q fastapi uvicorn[standard] httpx requests 2>> "$KEYMASTER_LOG"; \
+        echo "[$(date +"%Y-%m-%d %H:%M:%S")] Dependencies installed" >> "$KEYMASTER_LOG"; \
+    fi'
+
+# Configure OpenClaw
+ExecStartPre=/bin/bash -c 'echo "[$(date +"%Y-%m-%d %H:%M:%S")] Configuring OpenClaw..." >> "$KEYMASTER_LOG"'
+ExecStartPre=/home/%I/.openclaw/keymaster_venv/bin/python /home/%I/.openclaw/skills/keymaster/scripts/configure_openclaw.py --enable >> "$KEYMASTER_LOG" 2>&1
+
+# Main service
+ExecStart=/home/%I/.openclaw/keymaster_venv/bin/python -m uvicorn proxy.server:app --host 127.0.0.1 --port 8787 --loop uvloop --log-level info --access-log
+
+# Logging
+StandardOutput=append:/home/%I/.openclaw/keymaster.log
+StandardError=append:/home/%I/.openclaw/keymaster.log
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitInterval=60s
+StartLimitBurst=3
+
+# Timeouts
+TimeoutStartSec=60
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+TasksMax=infinity
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/%I/.openclaw
+
+[Install]
+WantedBy=multi-user.target

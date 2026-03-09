@@ -1,0 +1,517 @@
+#!/bin/bash
+# OpenClaw Keymaster Unified Management Script
+# Usage: ./keymaster [command]
+
+set -e
+
+USER_NAME="${USER:-ubuntu}"
+SERVICE_NAME="openclaw-keymaster"
+SERVICE_FULL="${SERVICE_NAME}@${USER_NAME}"
+LOG_FILE="$HOME/.openclaw/keymaster.log"
+VENV_DIR="$HOME/.openclaw/keymaster_venv"
+
+# Use venv Python if available, otherwise fall back to system Python
+if [ -f "$VENV_DIR/bin/python" ]; then
+    PYTHON="$VENV_DIR/bin/python"
+else
+    PYTHON="python3"
+fi
+VENV_DIR="$HOME/.openclaw/keymaster_venv"
+PYTHON_CMD="$VENV_DIR/bin/python"
+
+# If venv doesn't exist, fall back to system python
+if [ ! -f "$PYTHON_CMD" ]; then
+    PYTHON_CMD="python3"
+fi
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+show_banner() {
+    echo -e "${CYAN}"
+    echo "╔═══════════════════════════════════════════════════════════╗"
+    echo "║            OpenClaw Keymaster Manager                     ║"
+    echo "║       Intelligent API Key Rotation for NVIDIA           ║"
+    echo "╚═══════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+show_help() {
+    show_banner
+    echo -e "${BLUE}Usage:${NC} keymaster [command]"
+    echo ""
+    echo -e "${YELLOW}Service Management:${NC}"
+    echo "  start       Start the Keymaster service"
+    echo "  stop        Stop the Keymaster service"
+    echo "  restart     Restart the Keymaster service"
+    echo "  status      Show service status"
+    echo ""
+    echo -e "${YELLOW}Configuration:${NC}"
+    echo "  enable      Enable auto-start on boot"
+    echo "  disable     Disable auto-start on boot"
+    echo "  install     Install systemd service (requires sudo)"
+    echo ""
+    echo -e "${YELLOW}Monitoring:${NC}"
+    echo "  logs        View unified logs (follow mode)"
+    echo "  logcat      Show recent logs (like Android logcat)"
+    echo "  health      Check proxy health and key status"
+    echo "  stats       Show usage statistics"
+    echo ""
+    echo -e "${YELLOW}Key Management:${NC}"
+    echo "  reset       Reset all key cooldowns"
+    echo "  keys        List all keys and their status"
+    echo "  cooldowns   Show current cooldown status"
+    echo ""
+    echo -e "${YELLOW}OpenClaw Integration:${NC}"
+    echo "  direct      Configure OpenClaw for direct NVIDIA access"
+    echo "  proxy       Configure OpenClaw to use proxy (default)"
+    echo ""
+    echo -e "${YELLOW}Examples:${NC}"
+    echo "  keymaster start && keymaster logs"
+    echo "  keymaster status"
+    echo "  keymaster keys"
+    echo ""
+}
+
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+log_cmd() {
+    echo -e "${CYAN}[CMD]${NC} $1"
+}
+
+check_sudo() {
+    if [ "$EUID" -ne 0 ]; then
+        log_warn "This command requires sudo privileges"
+        exit 1
+    fi
+}
+
+start_service() {
+    show_banner
+    if systemctl is-active --quiet "$SERVICE_FULL" 2>/dev/null; then
+        log_info "Service is already running"
+        status_service
+        return 0
+    fi
+
+    log_cmd "Starting Keymaster service..."
+    if sudo systemctl start "$SERVICE_FULL" 2>/dev/null; then
+        sleep 2
+        if systemctl is-active --quiet "$SERVICE_FULL"; then
+            log_info "✓ Service started successfully"
+            echo ""
+            status_service
+            echo ""
+            log_info "View logs with: keymaster logs"
+        else
+            log_error "✗ Service failed to start"
+            log_info "Check logs: keymaster logcat"
+            return 1
+        fi
+    else
+        log_error "Failed to start service"
+        log_info "Try installing first: keymaster install"
+        return 1
+    fi
+}
+
+stop_service() {
+    log_cmd "Stopping Keymaster service..."
+
+    # Stop systemd service
+    sudo systemctl stop "$SERVICE_FULL" 2>/dev/null || true
+
+    # Kill any remaining proxy processes
+    pkill -f "uvicorn.*8787" 2>/dev/null || true
+    sleep 1
+
+    # Kill any remaining on port 8787
+    lsof -ti:8787 2>/dev/null | xargs kill -9 2>/dev/null || true
+
+    log_info "✓ Service stopped"
+
+    # Optionally revert to direct
+    read -p "Configure OpenClaw for direct NVIDIA access? [y/N] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        python3 ~/.openclaw/skills/keymaster/scripts/configure_openclaw.py --disable
+        log_info "OpenClaw configured for direct access"
+    fi
+}
+
+restart_service() {
+    show_banner
+    log_cmd "Restarting Keymaster service..."
+    sudo systemctl restart "$SERVICE_FULL"
+    sleep 2
+    if systemctl is-active --quiet "$SERVICE_FULL"; then
+        log_info "✓ Service restarted successfully"
+        status_service
+    else
+        log_error "✗ Service failed to restart"
+        return 1
+    fi
+}
+
+status_service() {
+    echo -e "${CYAN}╔═══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║                    Service Status                         ║${NC}"
+    echo -e "${CYAN}╚═══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # Service status
+    if systemctl is-active --quiet "$SERVICE_FULL" 2>/dev/null; then
+        echo -e "${GREEN}● Service:${NC} Running"
+        local pid=$(systemctl show "$SERVICE_FULL" -p MainPID --value)
+        echo -e "  PID: $pid"
+    else
+        echo -e "${RED}● Service:${NC} Stopped"
+    fi
+
+    # Check if enabled
+    if systemctl is-enabled --quiet "$SERVICE_FULL" 2>/dev/null; then
+        echo -e "${GREEN}● Auto-start:${NC} Enabled"
+    else
+        echo -e "${YELLOW}● Auto-start:${NC} Disabled"
+    fi
+
+    echo ""
+
+    # Proxy health
+    echo -e "${CYAN}Proxy Health:${NC}"
+    if curl -s http://127.0.0.1:8787/health 2>/dev/null > /tmp/keymaster_health.json; then
+        local total=$(jq -r '.total_keys // 0' /tmp/keymaster_health.json)
+        local available=$(jq -r '.available_keys // 0' /tmp/keymaster_health.json)
+        local cooling=$(jq -r '.cooling_keys // 0' /tmp/keymaster_health.json)
+        local requests=$(jq -r '.total_requests // 0' /tmp/keymaster_health.json)
+        local rate_limits=$(jq -r '.total_rate_limits // 0' /tmp/keymaster_health.json)
+
+        echo -e "  ${GREEN}✓${NC} Proxy responding on port 8787"
+        echo -e "  Keys: ${GREEN}$available available${NC} / $total total / ${YELLOW}$cooling cooling${NC}"
+        echo -e "  Requests: $requests | Rate Limits: $rate_limits"
+
+        # Show individual key status
+        echo ""
+        echo -e "${CYAN}Key Status:${NC}"
+        jq -r '.keys | to_entries[] | "  \(.key): \(.value.available | if . then "\u001b[32m●\u001b[0m available" else "\u001b[31m●\u001b[0m cooling (\(.value.cooldown_remaining)s)" end) [\(.value.role)]"' /tmp/keymaster_health.json
+    else
+        echo -e "  ${RED}✗${NC} Proxy not responding on port 8787"
+    fi
+
+    echo ""
+
+    # OpenClaw configuration
+    echo -e "${CYAN}OpenClaw Config:${NC}"
+    if [ -f ~/.openclaw/openclaw.json ]; then
+        if grep -q "http://127.0.0.1:8787" ~/.openclaw/openclaw.json 2>/dev/null; then
+            echo -e "  ${GREEN}✓${NC} Routed through proxy (localhost:8787)"
+        else
+            echo -e "  ${YELLOW}⚠${NC} Direct to NVIDIA (not using proxy)"
+        fi
+    else
+        echo -e "  ${RED}✗${NC} openclaw.json not found"
+    fi
+
+    rm -f /tmp/keymaster_health.json
+}
+
+view_logs() {
+    if [ ! -f "$LOG_FILE" ]; then
+        log_warn "Log file not found: $LOG_FILE"
+        log_info "Service may not have started yet"
+        return 1
+    fi
+
+    echo -e "${CYAN}╔═══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║                   Keymaster Logs                          ║${NC}"
+    echo -e "${CYAN}╚═══════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${YELLOW}Press Ctrl+C to exit${NC}"
+    echo ""
+
+    # Show last 50 lines, then follow
+    tail -n 50 "$LOG_FILE"
+    echo -e "\n${CYAN}--- Following new logs ---${NC}\n"
+    tail -f "$LOG_FILE"
+}
+
+logcat() {
+    if [ ! -f "$LOG_FILE" ]; then
+        log_warn "Log file not found"
+        return 1
+    fi
+
+    echo -e "${CYAN}╔═══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║              Recent Log Entries                           ║${NC}"
+    echo -e "${CYAN}╚═══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # Parse and colorize the log
+    tail -n 100 "$LOG_FILE" | while IFS= read -r line; do
+        if echo "$line" | grep -q "\[INIT\]"; then
+            echo -e "${CYAN}$line${NC}"
+        elif echo "$line" | grep -q "\[Proxy\]"; then
+            echo -e "${GREEN}$line${NC}"
+        elif echo "$line" | grep -q "\[KeyManager\]"; then
+            echo -e "${YELLOW}$line${NC}"
+        elif echo "$line" | grep -q "Error\|ERROR\|error:"; then
+            echo -e "${RED}$line${NC}"
+        elif echo "$line" | grep -q "✓"; then
+            echo -e "${GREEN}$line${NC}"
+        else
+            echo "$line"
+        fi
+    done
+}
+
+health_check() {
+    echo -e "${CYAN}╔═══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║                   Health Check                          ║${NC}"
+    echo -e "${CYAN}╚═══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    local all_good=true
+
+    # Check service
+    echo -n "Service running... "
+    if systemctl is-active --quiet "$SERVICE_FULL" 2>/dev/null; then
+        echo -e "${GREEN}✓${NC}"
+    else
+        echo -e "${RED}✗${NC}"
+        all_good=false
+    fi
+
+    # Check proxy
+    echo -n "Proxy responding... "
+    if curl -s http://127.0.0.1:8787/health > /tmp/health.json 2>/dev/null; then
+        echo -e "${GREEN}✓${NC}"
+    else
+        echo -e "${RED}✗${NC}"
+        all_good=false
+    fi
+
+    # Check auth-profiles
+    echo -n "Auth profiles... "
+    if [ -f ~/.openclaw/agents/main/agent/auth-profiles.json ]; then
+        local key_count=$(jq '.profiles | keys | map(select(startswith("nvidia:"))) | length' ~/.openclaw/agents/main/agent/auth-profiles.json 2>/dev/null || echo "0")
+        echo -e "${GREEN}✓${NC} ($key_count NVIDIA keys)"
+    else
+        echo -e "${RED}✗${NC}"
+        all_good=false
+    fi
+
+    # Check openclaw.json
+    echo -n "OpenClaw config... "
+    if [ -f ~/.openclaw/openclaw.json ]; then
+        if grep -q "http://127.0.0.1:8787" ~/.openclaw/openclaw.json 2>/dev/null; then
+            echo -e "${GREEN}✓${NC} (using proxy)"
+        else
+            echo -e "${YELLOW}⚠${NC} (direct mode)"
+        fi
+    else
+        echo -e "${RED}✗${NC}"
+        all_good=false
+    fi
+
+    echo ""
+
+    if $all_good; then
+        echo -e "${GREEN}All checks passed!${NC}"
+        return 0
+    else
+        echo -e "${RED}Some checks failed!${NC}"
+        return 1
+    fi
+}
+
+show_keys() {
+    echo -e "${CYAN}╔═══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║                   NVIDIA API Keys                       ║${NC}"
+    echo -e "${CYAN}╚═══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    if [ -f ~/.openclaw/agents/main/agent/auth-profiles.json ]; then
+        echo -e "${BLUE}Configured Keys:${NC}"
+        jq -r '.profiles | to_entries[] | select(.key | startswith("nvidia:")) | "  \(.key):\n    Provider: \(.value.provider)\n    Role: \(.value.role)\n    Priority: \(.value.priority)"' ~/.openclaw/agents/main/agent/auth-profiles.json
+    else
+        log_error "auth-profiles.json not found"
+    fi
+
+    echo ""
+
+    # Show current status from proxy
+    echo -e "${BLUE}Current Status:${NC}"
+    if curl -s http://127.0.0.1:8787/health 2>/dev/null | jq -r '.keys | to_entries[] | "  \(.key): \(.value.available | if . then "\u001b[32m● available\u001b[0m" else "\u001b[31m● cooling\u001b[0m (\(.value.cooldown_remaining)s)" end)"' 2>/dev/null; then
+        echo ""
+    else
+        log_warn "Could not reach proxy for live status"
+    fi
+}
+
+show_cooldowns() {
+    echo -e "${CYAN}╔═══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║                   Key Cooldowns                         ║${NC}"
+    echo -e "${CYAN}╚═══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    if ! curl -s http://127.0.0.1:8787/health 2>/dev/null > /tmp/health.json; then
+        log_error "Proxy not responding"
+        return 1
+    fi
+
+    local total=$(jq -r '.total_keys' /tmp/health.json)
+    local available=$(jq -r '.available_keys' /tmp/health.json)
+    local cooling=$(jq -r '.cooling_keys' /tmp/health.json)
+
+    echo -e "Summary: ${GREEN}$available available${NC} / ${YELLOW}$cooling cooling${NC} / $total total"
+    echo ""
+
+    echo "Key Details:"
+    jq -r '.keys | to_entries[] |
+        if .value.available then
+            "  \(.key): available [\(.value.role)]"
+        else
+            "  \(.key): cooling for \(.value.cooldown_remaining | floor)s [\(.value.role)]"
+        end' /tmp/health.json
+
+    rm -f /tmp/health.json
+}
+
+reset_keys() {
+    log_cmd "Resetting all key cooldowns..."
+
+    # Restart service to reset state
+    sudo systemctl restart "$SERVICE_FULL"
+
+    log_info "✓ All keys reset"
+
+    # Show new status
+    sleep 1
+    show_cooldowns
+}
+
+configure_direct() {
+    log_cmd "Configuring OpenClaw for direct NVIDIA access..."
+    $PYTHON ~/.openclaw/skills/keymaster/scripts/configure_openclaw.py --disable
+    log_info "OpenClaw now connects directly to NVIDIA"
+    log_warn "Key rotation is DISABLED"
+}
+
+configure_proxy() {
+    log_cmd "Configuring OpenClaw to use Keymaster proxy..."
+    $PYTHON ~/.openclaw/skills/keymaster/scripts/configure_openclaw.py --enable
+    log_info "OpenClaw now routes through proxy (localhost:8787)"
+    log_info "Key rotation is ENABLED"
+}
+
+install_service() {
+    show_banner
+    check_sudo
+
+    log_cmd "Installing Keymaster systemd service..."
+
+    # Check files exist
+    if [ ! -f "/home/$SUDO_USER/.openclaw/skills/keymaster/systemd/openclaw-keymaster.service" ]; then
+        log_error "Service file not found"
+        exit 1
+    fi
+
+    # Copy service file
+    cp "/home/$SUDO_USER/.openclaw/skills/keymaster/systemd/openclaw-keymaster.service" \
+       "/etc/systemd/system/"
+
+    # Reload systemd
+    systemctl daemon-reload
+
+    log_info "✓ Service installed"
+    echo ""
+
+    read -p "Enable and start the service now? [Y/n] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
+        systemctl enable "$SERVICE_FULL"
+        systemctl start "$SERVICE_FULL"
+        sleep 2
+
+        if systemctl is-active --quiet "$SERVICE_FULL"; then
+            log_info "✓ Service is running!"
+            status_service
+        else
+            log_error "✗ Service failed to start"
+            log_info "Check: keymaster logcat"
+        fi
+    fi
+}
+
+# Main
+case "${1:-status}" in
+    start)
+        start_service
+        ;;
+    stop)
+        stop_service
+        ;;
+    restart)
+        restart_service
+        ;;
+    status)
+        status_service
+        ;;
+    logs)
+        view_logs
+        ;;
+    logcat)
+        logcat
+        ;;
+    health)
+        health_check
+        ;;
+    keys)
+        show_keys
+        ;;
+    cooldowns)
+        show_cooldowns
+        ;;
+    reset)
+        reset_keys
+        ;;
+    enable)
+        sudo systemctl enable "$SERVICE_FULL"
+        log_info "Auto-start enabled"
+        ;;
+    disable)
+        sudo systemctl disable "$SERVICE_FULL"
+        log_info "Auto-start disabled"
+        ;;
+    install)
+        install_service
+        ;;
+    direct)
+        configure_direct
+        ;;
+    proxy)
+        configure_proxy
+        ;;
+    -h|--help|help)
+        show_help
+        ;;
+    *)
+        echo -e "${RED}Unknown command: $1${NC}"
+        show_help
+        exit 1
+        ;;
+esac

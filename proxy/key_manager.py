@@ -15,6 +15,13 @@ import asyncio
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
+from datetime import datetime
+
+
+def log_key(msg: str):
+    """Log with timestamp."""
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{ts}] [KEY] {msg}")
 
 
 @dataclass
@@ -26,11 +33,38 @@ class KeyState:
     cooldown_until: float = 0
     priority: int = 99
     semaphore: asyncio.Semaphore = None  # Concurrency limit per key
+    active_requests: int = 0  # Track active request count
+    _lock: asyncio.Lock = None  # Lock for updating active_requests
 
     def __post_init__(self):
         if self.semaphore is None:
-            # Limit to 1 concurrent request per key to prevent burst rate limits
-            self.semaphore = asyncio.Semaphore(1)
+            # Allow 2 concurrent requests per key (reduced from 5 for stability)
+            self.semaphore = asyncio.Semaphore(2)
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+
+    async def acquire(self) -> bool:
+        """Atomically acquire the key semaphore and increment active count."""
+        acquired = await self.semaphore.acquire()
+        if acquired:
+            async with self._lock:
+                self.active_requests += 1
+        return acquired
+
+    async def release(self):
+        """Release the key semaphore and decrement active count."""
+        async with self._lock:
+            self.active_requests = max(0, self.active_requests - 1)
+        self.semaphore.release()
+
+    def is_available(self, now: float = None) -> bool:
+        """Check if key is available (not cooling and not at capacity)."""
+        if now is None:
+            now = time.time()
+        if self.cooldown_until > now:
+            return False
+        # Check if we can acquire without blocking (has capacity)
+        return self.semaphore._value > 0
 
 
 class KeyManager:
@@ -41,7 +75,17 @@ class KeyManager:
     def __init__(self):
         self.keys: Dict[str, KeyState] = {}
         self._lock = asyncio.Lock()
+        self._key_index = 0  # Round-robin pointer
+        self._key_list: List[str] = []  # Ordered list of key names
+        self._index_lock = asyncio.Lock()  # Separate lock for index
         self._load_keys()
+
+    async def _get_next_key_index(self) -> int:
+        """Get next key index for round-robin selection (thread-safe)."""
+        async with self._index_lock:
+            idx = self._key_index
+            self._key_index = (self._key_index + 1) % len(self._key_list)
+            return idx
 
     def _load_keys(self):
         """Load keys from auth-profiles.json."""
@@ -70,33 +114,101 @@ class KeyManager:
         if not self.keys:
             raise ValueError("No NVIDIA keys found in auth-profiles.json")
 
-        print(f"[KeyManager] Loaded {len(self.keys)} keys")
+        # Build ordered list for round-robin
+        self._key_list = sorted(self.keys.keys())
+        log_key(f"Loaded {len(self.keys)} keys")
 
-    def get_key_for_request(self) -> Optional[KeyState]:
+    async def get_key_for_request(self) -> Optional[KeyState]:
         """
-        Get a random available key.
-        Returns None if ALL keys are on cooldown (will retry).
+        Get next available key using round-robin with atomic acquisition.
+        Returns None if ALL keys are on cooldown or at capacity.
         """
         now = time.time()
 
-        # Find all keys not on cooldown
-        available = [
-            key for key in self.keys.values()
-            if now >= key.cooldown_until
-        ]
+        # Try each key in round-robin order
+        for _ in range(len(self._key_list)):
+            idx = await self._get_next_key_index()
+            key_name = self._key_list[idx]
+            key = self.keys[key_name]
 
-        if not available:
+            # Skip if cooling
+            if now < key.cooldown_until:
+                continue
+
+            # Try to acquire (atomically checks capacity)
+            if await key.acquire():
+                log_key(f"{key_name} acquired (active: {key.active_requests})")
+                return key
+
+        # No keys available with capacity
+        return None
+
+    async def get_next_available_key(self, exclude_keys: set = None) -> Optional[KeyState]:
+        """
+        Get next available key for recovery with atomic acquisition.
+        Optionally excludes certain keys.
+        """
+        now = time.time()
+        exclude_keys = exclude_keys or set()
+
+        # Try round-robin order first
+        for _ in range(len(self._key_list)):
+            idx = await self._get_next_key_index()
+            key_name = self._key_list[idx]
+            key = self.keys[key_name]
+
+            if key_name in exclude_keys:
+                continue
+            if now < key.cooldown_until:
+                continue
+
+            # Try to acquire
+            if await key.acquire():
+                log_key(f"{key_name} acquired for recovery (active: {key.active_requests})")
+                return key
+
+        # Fallback: any available key not in exclude
+        for name in self._key_list:
+            if name in exclude_keys:
+                continue
+            key = self.keys[name]
+            if now < key.cooldown_until:
+                continue
+            if await key.acquire():
+                log_key(f"{name} acquired for recovery (active: {key.active_requests})")
+                return key
+
+        return None
+
+    def get_key_round_robin(self) -> Optional[KeyState]:
+        """
+        Get next available key using round-robin.
+        Returns None if ALL keys are on cooldown.
+        """
+        now = time.time()
+        num_keys = len(self._key_list)
+
+        if num_keys == 0:
             return None
 
-        # Random selection from available keys
-        return random.choice(available)
+        # Try each key in round-robin order
+        for _ in range(num_keys):
+            idx = self._get_next_key_index()
+            key_name = self._key_list[idx]
+            key = self.keys.get(key_name)
+
+            if key and now >= key.cooldown_until:
+                return key
+
+        # All keys cooling
+        return None
 
     def mark_cooldown(self, key_name: str, cooldown_seconds: Optional[int] = None):
         """Mark a key as cooling."""
         if key_name in self.keys:
             cooldown = cooldown_seconds or self.DEFAULT_COOLDOWN
             self.keys[key_name].cooldown_until = time.time() + cooldown
-            print(f"[KeyManager] Key {key_name} on cooldown for {cooldown}s")
+            log_key(f"{key_name} → cooling {cooldown}s")
 
     def get_cooldown_remaining(self, key_name: str) -> float:
         """Get seconds remaining for key cooldown."""
@@ -125,7 +237,7 @@ class KeyManager:
         """Reset all cooldowns (emergency use)."""
         for key in self.keys.values():
             key.cooldown_until = 0
-        print("[KeyManager] All keys reset")
+        log_key("All keys reset")
 
     def get_status(self) -> Dict:
         """Get current status of all keys."""

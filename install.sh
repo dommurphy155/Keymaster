@@ -1,12 +1,19 @@
 #!/bin/bash
 #
-# OpenClaw Keymaster Auto-Installer
+# OpenClaw Keymaster Unified Auto-Installer
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/dommurphy155/Keymaster/main/install.sh | bash
 #   OR
 #   bash install.sh
 #
+# This script:
+# 1. Checks prerequisites (Python 3.8+, systemd)
+# 2. Creates isolated virtual environment
+# 3. Installs all dependencies
+# 4. Configures the unified systemd service
+# 5. Installs the 'keymaster' management command
+# 6. Starts everything together with unified logging
 
 set -e
 
@@ -15,195 +22,320 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# Config
-REPO_URL="https://github.com/dommurphy155/Keymaster.git"
-INSTALL_DIR="$HOME/.openclaw/skills/keymaster"
-PROXY_PORT=8787
+# Configuration
+USER_NAME="${USER:-$(whoami)}"
+HOME_DIR="${HOME}"
+KEYMASTER_DIR="${HOME_DIR}/.openclaw/skills/keymaster"
+VENV_DIR="${HOME_DIR}/.openclaw/keymaster_venv"
+LOG_FILE="${HOME_DIR}/.openclaw/keymaster.log"
+SERVICE_NAME="openclaw-keymaster"
+SERVICE_FULL="${SERVICE_NAME}@${USER_NAME}"
 
-# Logging
-log() { echo -e "${BLUE}[$(date +%H:%M:%S)]${NC} $1"; }
-success() { echo -e "${GREEN}[✓]${NC} $1"; }
-warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-error() { echo -e "${RED}[✗]${NC} $1"; }
-
-# Check if running as root (we don't want that)
-if [ "$EUID" -eq 0 ]; then
-   error "Please don't run as root"
-   exit 1
-fi
-
-log "OpenClaw Keymaster Auto-Installer"
-echo "=================================="
-echo ""
-
-# Check prerequisites
-log "Checking prerequisites..."
-
-# Check Python
-if ! command -v python3 &> /dev/null; then
-    error "Python 3 is required but not installed"
-    exit 1
-fi
-
-PYTHON_VERSION=$(python3 --version | cut -d ' ' -f 2 | cut -d '.' -f 1-2)
-log "Python version: $PYTHON_VERSION"
-
-# Check if OpenClaw exists
-if [ ! -d "$HOME/.openclaw" ]; then
-    warn "OpenClaw not found at $HOME/.openclaw"
-    warn "Please install OpenClaw first: https://openclaw.dev"
-    read -p "Continue anyway? (y/N) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
-    fi
-fi
-
-# Install Python dependencies
-log "Installing Python dependencies..."
-
-pip3 install --user fastapi uvicorn httpx 2>/dev/null || {
-    warn "pip install failed, trying with --break-system-packages..."
-    pip3 install fastapi uvicorn httpx --break-system-packages 2>/dev/null || {
-        error "Failed to install dependencies"
-        exit 1
-    }
+# Print helpers
+print_banner() {
+    echo -e "${CYAN}"
+    echo "╔════════════════════════════════════════════════════════════════╗"
+    echo "║                                                                ║"
+    echo "║          OpenClaw Keymaster - Unified Installer               ║"
+    echo "║     Intelligent API Key Rotation for NVIDIA LLMs            ║"
+    echo "║                                                                ║"
+    echo "╚════════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
 }
 
-success "Dependencies installed"
+print_step() {
+    echo -e "${BLUE}[Step $1/7]${NC} $2"
+}
 
-# Clone or update repository
-log "Installing Keymaster..."
+print_success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
 
-if [ -d "$INSTALL_DIR" ]; then
-    log "Keymaster already exists, updating..."
-    cd "$INSTALL_DIR"
-    git pull origin main
-else
-    log "Cloning Keymaster repository..."
-    mkdir -p "$HOME/.openclaw/skills"
-    git clone "$REPO_URL" "$INSTALL_DIR"
-fi
+print_error() {
+    echo -e "${RED}✗${NC} $1"
+}
 
-success "Keymaster installed at $INSTALL_DIR"
+print_warn() {
+    echo -e "${YELLOW}⚠${NC} $1"
+}
 
-# Check if auth-profiles.json exists
-AUTH_FILE="$HOME/.openclaw/agents/main/agent/auth-profiles.json"
-if [ ! -f "$AUTH_FILE" ]; then
-    warn "auth-profiles.json not found!"
-    warn "Please configure your NVIDIA API keys first."
-    echo ""
-    echo "See: $INSTALL_DIR/SETUP.md for instructions"
-    echo ""
-    read -p "Continue with setup? (y/N) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+print_info() {
+    echo -e "${CYAN}ℹ${NC} $1"
+}
+
+# Check if running with sudo
+check_sudo() {
+    if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
+        print_error "This script should NOT be run with sudo"
+        print_info "It will prompt for sudo only when needed for systemd"
         exit 1
     fi
-fi
+}
 
-# Configure OpenClaw to use proxy
-log "Configuring OpenClaw..."
+# Step 1: Check prerequisites
+check_prerequisites() {
+    print_step "1" "Checking prerequisites..."
 
-python3 "$INSTALL_DIR/scripts/configure_openclaw.py" --enable
+    # Check Python
+    if ! command -v python3 &> /dev/null; then
+        print_error "Python 3 is required but not installed"
+        exit 1
+    fi
 
-success "OpenClaw configured to use proxy"
+    PYTHON_VERSION=$(python3 --version 2>&1 | cut -d' ' -f2)
+    print_success "Python ${PYTHON_VERSION} found"
 
-# Install systemd service (if systemd is available)
-if command -v systemctl &> /dev/null; then
-    log "Installing systemd service..."
-
-    SERVICE_FILE="$INSTALL_DIR/systemd/openclaw-proxy.service"
-    USER_SERVICE_DIR="$HOME/.config/systemd/user"
-
-    # Create user service directory
-    mkdir -p "$USER_SERVICE_DIR"
-
-    # Replace template variables
-    sed -e "s|%USER%|$USER|g" \
-        -e "s|%HOME%|$HOME|g" \
-        -e "s|%PYTHON%|$(which python3)|g" \
-        "$SERVICE_FILE" > "$USER_SERVICE_DIR/openclaw-proxy.service"
-
-    # Reload systemd
-    systemctl --user daemon-reload
-
-    # Enable service
-    systemctl --user enable openclaw-proxy.service
-
-    success "Systemd service installed"
-
-    # Start service
-    log "Starting proxy service..."
-    systemctl --user start openclaw-proxy.service
-
-    # Wait for service to start
-    sleep 2
-
-    # Check status
-    if systemctl --user is-active --quiet openclaw-proxy.service; then
-        success "Proxy service is running!"
+    # Check systemd
+    if ! command -v systemctl > /dev/null 2>&1; then
+        print_warn "systemd not found - service mode unavailable"
+        print_info "You can still run keymaster manually"
     else
-        error "Failed to start proxy service"
-        systemctl --user status openclaw-proxy.service
+        print_success "systemd available"
+    fi
+
+    # Check keymaster directory
+    if [ ! -d "$KEYMASTER_DIR" ]; then
+        print_error "Keymaster directory not found: ${KEYMASTER_DIR}"
+        print_info "Please ensure keymaster is installed at ~/.openclaw/skills/keymaster"
         exit 1
     fi
-else
-    warn "systemd not available, using manual start..."
+    print_success "Keymaster directory found"
+}
 
-    # Start proxy manually
-    log "Starting proxy..."
-    python3 "$INSTALL_DIR/scripts/start_proxy.py" --daemon
+# Step 2: Create virtual environment
+setup_venv() {
+    print_step "2" "Setting up Python virtual environment..."
 
-    # Add to .bashrc for auto-start
-    if ! grep -q "keymaster/scripts/start_proxy.py" "$HOME/.bashrc" 2>/dev/null; then
-        echo "" >> "$HOME/.bashrc"
-        echo "# Start OpenClaw Keymaster Proxy" >> "$HOME/.bashrc"
-        echo "python3 $INSTALL_DIR/scripts/start_proxy.py --daemon 2>/dev/null || true" >> "$HOME/.bashrc"
-        success "Added auto-start to .bashrc"
+    if [ -d "$VENV_DIR" ]; then
+        print_warn "Virtual environment already exists"
+        print_info "Updating dependencies..."
+    else
+        print_info "Creating virtual environment at ${VENV_DIR}..."
+        python3 -m venv "$VENV_DIR"
+        print_success "Virtual environment created"
     fi
-fi
 
-# Verify installation
-echo ""
-log "Verifying installation..."
+    # Upgrade pip
+    "$VENV_DIR/bin/pip" install --quiet --upgrade pip
 
-# Check proxy health
-for i in 1 2 3; do
-    if curl -s http://127.0.0.1:$PROXY_PORT/health > /dev/null 2>&1; then
-        success "Proxy is responding on port $PROXY_PORT"
-        break
+    # Install dependencies
+    print_info "Installing dependencies (this may take a minute)..."
+    "$VENV_DIR/bin/pip" install --quiet \
+        fastapi \
+        uvicorn[standard] \
+        httpx \
+        requests \
+        aiohttp
+
+    print_success "Dependencies installed"
+}
+
+# Step 3: Check configuration
+check_config() {
+    print_step "3" "Checking configuration..."
+
+    # Check auth-profiles.json
+    AUTH_PROFILES="${HOME_DIR}/.openclaw/agents/main/agent/auth-profiles.json"
+    if [ ! -f "$AUTH_PROFILES" ]; then
+        print_error "auth-profiles.json not found!"
+        print_info "Please create it with your NVIDIA API keys"
+        print_info "Location: ${AUTH_PROFILES}"
+        exit 1
     fi
-    if [ $i -eq 3 ]; then
-        error "Proxy health check failed"
-        warn "Check logs: systemctl --user status openclaw-proxy"
-    fi
-    sleep 1
-done
 
-# Show status
-if command -v systemctl &> /dev/null; then
+    # Count keys
+    KEY_COUNT=$(jq -r '.profiles | keys | map(select(startswith("nvidia:"))) | length' "$AUTH_PROFILES" 2>/dev/null || echo "0")
+
+    if [ "$KEY_COUNT" -eq "0" ]; then
+        print_error "No NVIDIA keys found in auth-profiles.json"
+        exit 1
+    fi
+
+    print_success "Found ${KEY_COUNT} NVIDIA API keys"
+
+    # Check openclaw.json
+    if [ ! -f "${HOME_DIR}/.openclaw/openclaw.json" ]; then
+        print_warn "openclaw.json not found"
+        print_info "You may need to configure OpenClaw separately"
+    else
+        print_success "OpenClaw configuration found"
+    fi
+}
+
+# Step 4: Install systemd service
+install_service() {
+    print_step "4" "Installing systemd service..."
+
+    if ! command -v systemctl > /dev/null 2>&1; then
+        print_warn "systemd not available - skipping service installation"
+        return 0
+    fi
+
+    # Check if we have sudo access
+    if ! sudo -n true 2>/dev/null; then
+        print_warn "Sudo access required for service installation"
+        print_info "Please enter your password when prompted..."
+    fi
+
+    # Install service file
+    SERVICE_FILE="${KEYMASTER_DIR}/systemd/openclaw-keymaster@.service"
+    if [ ! -f "$SERVICE_FILE" ]; then
+        print_error "Service file not found: ${SERVICE_FILE}"
+        exit 1
+    fi
+
+    sudo cp "$SERVICE_FILE" "/etc/systemd/system/"
+    sudo systemctl daemon-reload
+
+    print_success "Service file installed"
+}
+
+# Step 5: Configure OpenClaw
+configure_openclaw() {
+    print_step "5" "Configuring OpenClaw..."
+
+    CONFIGURE_SCRIPT="${KEYMASTER_DIR}/scripts/configure_openclaw.py"
+    if [ -f "$CONFIGURE_SCRIPT" ]; then
+        "$VENV_DIR/bin/python" "$CONFIGURE_SCRIPT" --enable
+        print_success "OpenClaw configured to use proxy"
+    else
+        print_warn "configure_openclaw.py not found"
+    fi
+}
+
+# Step 6: Install keymaster command
+install_command() {
+    print_step "6" "Installing 'keymaster' command..."
+
+    KEYMASTER_BIN="${KEYMASTER_DIR}/keymaster"
+
+    if [ -f "$KEYMASTER_BIN" ]; then
+        chmod +x "$KEYMASTER_BIN"
+
+        # Try to create symlink
+        if [ -w "/usr/local/bin" ]; then
+            sudo ln -sf "$KEYMASTER_BIN" /usr/local/bin/keymaster 2>/dev/null || true
+            print_success "'keymaster' command available globally"
+        elif [ -d "${HOME_DIR}/.local/bin" ]; then
+            mkdir -p "${HOME_DIR}/.local/bin"
+            ln -sf "$KEYMASTER_BIN" "${HOME_DIR}/.local/bin/keymaster" 2>/dev/null || true
+            print_success "'keymaster' command installed to ~/.local/bin"
+            print_info "Make sure ~/.local/bin is in your PATH"
+        else
+            print_success "'keymaster' command available at: ${KEYMASTER_BIN}"
+        fi
+    else
+        print_warn "keymaster binary not found"
+    fi
+}
+
+# Step 7: Start service
+start_service() {
+    print_step "7" "Starting Keymaster service..."
+
+    if ! command -v systemctl > /dev/null 2>&1; then
+        print_warn "systemd not available - starting manually..."
+        print_info "To start keymaster manually:"
+        print_info "  ${KEYMASTER_DIR}/scripts/run_unified.sh"
+        return 0
+    fi
+
+    # Enable and start
+    sudo systemctl enable "$SERVICE_FULL"
+
+    if sudo systemctl start "$SERVICE_FULL"; then
+        print_success "Service started"
+
+        # Wait for it to be ready
+        print_info "Waiting for service to initialize..."
+        for i in {1..10}; do
+            sleep 1
+            if curl -s http://127.0.0.1:8787/health >/dev/null 2>&1; then
+                print_success "Proxy is responding!"
+                return 0
+            fi
+            echo -n "."
+        done
+        echo
+        print_warn "Service started but proxy not yet responding"
+    else
+        print_error "Failed to start service"
+        return 1
+    fi
+}
+
+# Show final summary
+show_summary() {
     echo ""
-    log "Service status:"
-    systemctl --user status openclaw-proxy.service --no-pager -l
-fi
+    echo -e "${CYAN}╔════════════════════════════════════════════════════════════════╗"
+    echo "║                     Installation Complete!                     ║"
+    echo "╚════════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo ""
 
-# Final message
-echo ""
-echo "=================================="
-success "Keymaster installation complete!"
-echo ""
-echo "Commands:"
-echo "  systemctl --user status openclaw-proxy    # Check status"
-echo "  systemctl --user stop openclaw-proxy      # Stop proxy"
-echo "  systemctl --user start openclaw-proxy     # Start proxy"
-echo "  systemctl --user restart openclaw-proxy   # Restart proxy"
-echo ""
-echo "Proxy URL: http://127.0.0.1:$PROXY_PORT"
-echo ""
-success "OpenClaw will now automatically rotate through your API keys!"
-echo ""
-echo "Try it:"
-echo "  openclaw 'Create a complex dashboard'"
+    # Check service status
+    if command -v systemctl > /dev/null 2>&1; then
+        if systemctl is-active --quiet "$SERVICE_FULL" 2>/dev/null; then
+            echo -e "Service Status: ${GREEN}● Running${NC}"
+        else
+            echo -e "Service Status: ${RED}● Stopped${NC}"
+        fi
+
+        if systemctl is-enabled --quiet "$SERVICE_FULL" 2>/dev/null; then
+            echo -e "Auto-start: ${GREEN}● Enabled${NC}"
+        else
+            echo -e "Auto-start: ${YELLOW}● Disabled${NC}"
+        fi
+    fi
+
+    # Check proxy
+    if curl -s http://127.0.0.1:8787/health >/dev/null 2>&1; then
+        echo -e "Proxy: ${GREEN}● Responding on port 8787${NC}"
+    else
+        echo -e "Proxy: ${YELLOW}● Not yet responding${NC}"
+    fi
+
+    echo ""
+    echo -e "${CYAN}Quick Commands:${NC}"
+    echo "  keymaster status    - Check service status"
+    echo "  keymaster logs      - View unified logs"
+    echo "  keymaster keys      - List API keys"
+    echo "  keymaster health    - Run health check"
+    echo ""
+    echo -e "${CYAN}Logs:${NC}"
+    echo "  tail -f ${LOG_FILE}"
+    echo ""
+    echo -e "${CYAN}Service Control:${NC}"
+    echo "  keymaster start     - Start the service"
+    echo "  keymaster stop      - Stop the service"
+    echo "  keymaster restart   - Restart the service"
+    echo ""
+    echo -e "${GREEN}Keymaster is now running with unified logging!${NC}"
+    echo -e "All logs go to: ${LOG_FILE}"
+    echo -e "OpenClaw will automatically use the proxy for all NVIDIA API calls."
+    echo ""
+}
+
+# Main installation flow
+main() {
+    print_banner
+
+    check_sudo
+    check_prerequisites
+    setup_venv
+    check_config
+    install_service
+    configure_openclaw
+    install_command
+    start_service
+    show_summary
+}
+
+# Handle script interruption
+trap 'print_error "Installation interrupted"; exit 1' INT TERM
+
+# Run main
+main

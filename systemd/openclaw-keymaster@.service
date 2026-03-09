@@ -1,0 +1,54 @@
+[Unit]
+Description=OpenClaw Keymaster - Unified API Key Rotation Service
+Documentation=https://github.com/dommurphy155/Keymaster
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+WorkingDirectory=/home/%i/.openclaw/skills/keymaster
+
+# Environment
+Environment="HOME=/home/%i"
+Environment="VIRTUAL_ENV=/home/%i/.openclaw/keymaster_venv"
+Environment="PATH=/home/%i/.openclaw/keymaster_venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=/home/%i/.openclaw/skills/keymaster"
+Environment="KEYMASTER_LOG=/home/%i/.openclaw/keymaster.log"
+
+# Pre-start: Setup venv and configure
+ExecStartPre=/bin/bash /home/%i/.openclaw/skills/keymaster/scripts/service-setup.sh
+
+# Main service - Unified runner that handles everything
+ExecStart=/bin/bash /home/%i/.openclaw/skills/keymaster/scripts/run_unified.sh
+
+# Logging
+StandardOutput=append:/home/%i/.openclaw/keymaster.log
+StandardError=append:/home/%i/.openclaw/keymaster.log
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitInterval=60s
+StartLimitBurst=3
+
+# Timeouts
+TimeoutStartSec=60
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+TasksMax=infinity
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/%i/.openclaw
+
+[Install]
+WantedBy=multi-user.target
