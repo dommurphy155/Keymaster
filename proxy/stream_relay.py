@@ -97,15 +97,36 @@ class StreamRelay:
                 print(f"[RELAY] Generator error: {e}")
                 break
 
-    async def send_frame(self, content: str):
+    async def send_frame(self, content: str = None, tool_calls: list = None, finish_reason: str = None, full_delta: dict = None):
         """
         Send a properly formatted SSE data frame.
+        Supports content text, tool_calls, or a full delta dict.
         """
-        if not content:
+        if full_delta:
+            # Send the complete delta as provided by upstream
+            frame_data = {"choices": [{"delta": full_delta}]}
+            if finish_reason:
+                frame_data["choices"][0]["finish_reason"] = finish_reason
+            frame = f'data: {json.dumps(frame_data)}\n\n'
+            await self.output_queue.put(frame.encode())
+            self.tokens_sent += 1
             return
 
-        # Build SSE frame
-        frame = f'data: {json.dumps({"choices": [{"delta": {"content": content}}]})}\n\n'
+        # Build delta from components
+        delta = {}
+        if content:
+            delta["content"] = content
+        if tool_calls:
+            delta["tool_calls"] = tool_calls
+
+        if not delta:
+            return
+
+        frame_data = {"choices": [{"delta": delta}]}
+        if finish_reason:
+            frame_data["choices"][0]["finish_reason"] = finish_reason
+
+        frame = f'data: {json.dumps(frame_data)}\n\n'
         await self.output_queue.put(frame.encode())
         self.tokens_sent += 1
 
@@ -140,4 +161,7 @@ class StreamRelay:
 
     async def close(self):
         """Signal end of stream."""
+        # Send SSE completion marker before sentinel so client knows stream is done
+        if not self.is_complete:
+            await self.send_done()
         await self.output_queue.put(None)

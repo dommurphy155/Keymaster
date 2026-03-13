@@ -213,26 +213,29 @@ async def stream_from_key(
                             await relay.send_done()
                             raise StreamComplete()
 
-                        # Parse JSON and extract content
+                        # Parse JSON and extract content/tool_calls
                         try:
                             parsed = json.loads(data)
                             if "choices" in parsed and len(parsed["choices"]) > 0:
                                 choice = parsed["choices"][0]
+                                delta = choice.get("delta", {})
+                                finish_reason = choice.get("finish_reason")
 
-                                if "delta" in choice and "content" in choice["delta"]:
-                                    content = choice["delta"]["content"]
+                                # Handle content
+                                if "content" in delta:
+                                    content = delta["content"]
                                     if content:
                                         # Deduplicate if this is a recovery stream
                                         if is_recovery:
                                             deduped = dedup_buffer.dedup(content)
                                             if deduped:
-                                                await relay.send_frame(deduped)
+                                                await relay.send_frame(content=deduped)
                                                 await metrics.inc("total_tokens_streamed")
                                             else:
                                                 log_dedup(f"Skipped duplicate: '{content[:30]}...'")
                                         else:
                                             # Normal stream - send immediately
-                                            await relay.send_frame(content)
+                                            await relay.send_frame(content=content)
                                             dedup_buffer.add_sent(content)
                                             await metrics.inc("total_tokens_streamed")
 
@@ -241,6 +244,24 @@ async def stream_from_key(
                                         token_count += 1
                                         if token_count <= 3:
                                             log_stream(f"[{request_id}] token_{token_count}: '{content[:30]}...'")
+
+                                # Handle tool_calls - CRITICAL for OpenClaw to execute tools
+                                if "tool_calls" in delta and delta["tool_calls"]:
+                                    log_stream(f"[{request_id}] tool_calls detected, forwarding...")
+                                    await relay.send_frame(tool_calls=delta["tool_calls"], finish_reason=finish_reason)
+                                    await metrics.inc("total_tokens_streamed")
+
+                                # Handle other delta fields (role, etc)
+                                has_content = "content" in delta and delta["content"]
+                                has_tool_calls = "tool_calls" in delta and delta["tool_calls"]
+                                if delta and not has_content and not has_tool_calls:
+                                    # Forward any other delta fields
+                                    await relay.send_frame(full_delta=delta, finish_reason=finish_reason)
+
+                                # Handle finish_reason (especially "tool_calls")
+                                if finish_reason:
+                                    log_stream(f"[{request_id}] finish_reason: {finish_reason}")
+
                         except json.JSONDecodeError:
                             log_err(f"[{request_id}] Invalid JSON in SSE: {data[:100]}")
                             continue
