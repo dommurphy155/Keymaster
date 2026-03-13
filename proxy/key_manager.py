@@ -64,7 +64,8 @@ class KeyState:
         if self.cooldown_until > now:
             return False
         # Check if we can acquire without blocking (has capacity)
-        return self.semaphore._value > 0
+        # locked() returns True if semaphore counter is 0 (can't acquire)
+        return not self.semaphore.locked()
 
 
 class KeyManager:
@@ -180,7 +181,7 @@ class KeyManager:
 
         return None
 
-    def get_key_round_robin(self) -> Optional[KeyState]:
+    async def get_key_round_robin(self) -> Optional[KeyState]:
         """
         Get next available key using round-robin.
         Returns None if ALL keys are on cooldown.
@@ -193,7 +194,7 @@ class KeyManager:
 
         # Try each key in round-robin order
         for _ in range(num_keys):
-            idx = self._get_next_key_index()
+            idx = await self._get_next_key_index()
             key_name = self._key_list[idx]
             key = self.keys.get(key_name)
 
